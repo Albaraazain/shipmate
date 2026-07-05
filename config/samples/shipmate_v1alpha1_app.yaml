@@ -1,0 +1,35 @@
+apiVersion: shipmate.florya.co/v1alpha1
+kind: App
+metadata:
+  labels:
+    app.kubernetes.io/name: shipmate
+    app.kubernetes.io/managed-by: kustomize
+  name: app-sample
+spec:
+  image: nginxdemos/hello:0.4
+  port: 80
+  replicas: 2
+  domain: hello.local
+  env:
+    - name: GREETING
+      value: shipmate
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+  backup:
+    schedule: "0 3 * * *"
+    image: rclone/rclone:1.68
+    command:
+      - /bin/sh
+      - -c
+      - |
+        rclone copy /data ":s3,endpoint=${S3_ENDPOINT},env_auth=true:${S3_BUCKET}/${S3_PREFIX}$(date +%Y-%m-%d)"
+    s3:
+      endpoint: https://fsn1.your-objectstorage.com
+      bucket: albaraa
+      prefix: shipmate-demo/
+      secretRef:
+        name: s3-credentials
