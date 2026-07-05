@@ -20,7 +20,7 @@ Type "kubectl get apps"
 Enter
 Sleep 3s
 
-Type "curl -sI http://hello.62.238.30.198.nip.io | head -n1"
+Type "curl -sI http://hello.178.105.147.131.nip.io | head -n1"
 Enter
 Sleep 3s
 

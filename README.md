@@ -7,7 +7,7 @@ controller keeps the cluster converged on it.
 ![shipmate demo: self-healing, scaling via the CR, and cascade deletion](docs/demo.gif)
 
 *Live demo (recorded against MicroK8s on a Hetzner box):
-[hello.62.238.30.198.nip.io](http://hello.62.238.30.198.nip.io)*
+[hello.178.105.147.131.nip.io](http://hello.178.105.147.131.nip.io)*
 
 ```yaml
 apiVersion: shipmate.florya.co/v1alpha1
