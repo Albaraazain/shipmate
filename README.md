@@ -4,6 +4,11 @@ A Kubernetes operator that ships your apps. One custom resource declares a
 complete web application — workload, networking, scheduled backups — and a
 controller keeps the cluster converged on it.
 
+![shipmate demo: self-healing, scaling via the CR, and cascade deletion](docs/demo.gif)
+
+*Live demo (recorded against MicroK8s on a Hetzner box):
+[hello.62.238.30.198.nip.io](http://hello.62.238.30.198.nip.io)*
+
 ```yaml
 apiVersion: shipmate.florya.co/v1alpha1
 kind: App
