@@ -14,6 +14,14 @@ PUBLIC_IP=${PUBLIC_IP:?set PUBLIC_IP to the public IP of the cluster node}
 DOMAIN="db-demo.${PUBLIC_IP}.nip.io"
 APP_NAME="db-demo"
 
+echo "==> Checking for a StorageClass"
+if [ -z "$(kubectl get storageclass -o name)" ]; then
+  echo "No StorageClass found in this cluster — the database PVC would sit" >&2
+  echo "Pending forever and the StatefulSet would never schedule. On" >&2
+  echo "MicroK8s: microk8s enable hostpath-storage" >&2
+  exit 1
+fi
+
 echo "==> Installing cert-manager ${CERT_MANAGER_VERSION}"
 kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
 

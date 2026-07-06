@@ -137,6 +137,30 @@ Setting `database` injects `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`,
 `PGDATABASE`, and `DATABASE_URL` into the app container automatically —
 any Postgres client library picks these up with zero extra configuration.
 
+## Proven live
+
+![Proof: a real Let's Encrypt cert, then a database pod killed and its data
+read back intact](docs/demo-database-tls.gif)
+
+*Second live app on the same cluster:
+[db-demo.178.105.147.131.nip.io](https://db-demo.178.105.147.131.nip.io) —
+`spec.tls` and `spec.database` both set.*
+
+The GIF above is a real recording, not staged output: `curl -v` against the
+public URL shows `issuer: Let's Encrypt` and `SSL certificate verify ok.`
+with no `-k` flag, then a row is written directly into the
+operator-provisioned Postgres, the pod is deleted outright, and once the
+StatefulSet brings a fresh pod up, the same row reads back — proving the
+PVC and the once-generated credentials both survived a hard pod replacement,
+not just a graceful restart.
+
+Running this for real also surfaced a genuine gap the envtest suite
+can't: **MicroK8s ships with no default StorageClass**, so the database
+PVC sat `Pending` forever and the StatefulSet never scheduled until
+`microk8s enable hostpath-storage` was run. `spec.database` needs *some*
+StorageClass to exist in the target cluster — set
+`spec.database.storageClassName` explicitly if the cluster has no default.
+
 ## Quickstart
 
 On any cluster (kind, minikube, a real one):
@@ -219,6 +243,12 @@ TLS annotation/spec add-and-remove cycle, and CRD-level rejection of
   (single-instance Postgres; see Design decisions for why it isn't HA).
 - `ServiceMonitor` support behind a spec flag, guarded by CRD discovery, so
   the controller does not require the Prometheus Operator to exist.
+- Surface missing-StorageClass as a status condition instead of a silent
+  `Pending` PVC. Found the hard way running the live database demo: the
+  demo script now preflights this itself (see `hack/demo-database-tls.sh`),
+  but a real user hitting it on their own cluster gets no signal from the
+  controller at all today — the fix belongs in `reconcileDatabase`, not in
+  a demo script.
 - Validating admission webhook (reject malformed cron expressions at
   admission time instead of at CronJob creation; the domain/tls check is
   already enforced via a CEL rule on the CRD, no webhook needed for that
