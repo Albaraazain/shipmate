@@ -10,7 +10,7 @@ set -euo pipefail
 
 CERT_MANAGER_VERSION=${CERT_MANAGER_VERSION:-v1.20.3}
 ACME_EMAIL=${ACME_EMAIL:-admin@florya.co}
-PUBLIC_IP=${PUBLIC_IP:?set PUBLIC_IP to the cluster node's public IP}
+PUBLIC_IP=${PUBLIC_IP:?set PUBLIC_IP to the public IP of the cluster node}
 DOMAIN="db-demo.${PUBLIC_IP}.nip.io"
 APP_NAME="db-demo"
 
