@@ -110,6 +110,39 @@ spec:
                 - s3
                 - schedule
                 type: object
+              database:
+                description: |-
+                  database provisions a single-instance Postgres and injects its
+                  connection details into the app container; clearing it later removes
+                  the database StatefulSet and Service but retains its Secret and
+                  PersistentVolumeClaim (see DatabaseSpec).
+                properties:
+                  engine:
+                    default: postgres
+                    description: engine selects the database engine. Only "postgres"
+                      is supported today.
+                    enum:
+                    - postgres
+                    type: string
+                  storageClassName:
+                    description: |-
+                      storageClassName selects a specific StorageClass; empty uses the
+                      cluster default.
+                    type: string
+                  storageSize:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    default: 1Gi
+                    description: storageSize is the size of the PersistentVolumeClaim
+                      for data.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  version:
+                    default: 16-alpine
+                    description: version is the image tag for the database engine.
+                    type: string
+                type: object
               domain:
                 description: |-
                   domain exposes the app through an Ingress at this host. Leave empty
@@ -350,9 +383,27 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
+              tls:
+                description: |-
+                  tls requests a cert-manager certificate for domain. Requires domain to
+                  be set; clearing it later removes the TLS configuration from the
+                  Ingress (the Secret cert-manager created is left in place).
+                properties:
+                  clusterIssuerName:
+                    description: |-
+                      clusterIssuerName is the cert-manager ClusterIssuer to request
+                      certificates from.
+                    minLength: 1
+                    type: string
+                required:
+                - clusterIssuerName
+                type: object
             required:
             - image
             type: object
+            x-kubernetes-validations:
+            - message: spec.tls requires spec.domain to be set
+              rule: '!has(self.tls) || self.domain != '''''
           status:
             description: status defines the observed state of App
             properties:

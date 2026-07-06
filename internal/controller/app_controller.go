@@ -18,7 +18,10 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
+	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -48,6 +51,32 @@ const (
 
 	conditionAvailable   = "Available"
 	conditionProgressing = "Progressing"
+
+	// Database credential Secret keys, matching the env vars the official
+	// postgres image expects — the database container consumes this Secret
+	// directly via envFrom with no key remapping.
+	secretKeyPostgresUser     = "POSTGRES_USER"
+	secretKeyPostgresPassword = "POSTGRES_PASSWORD"
+	secretKeyPostgresDB       = "POSTGRES_DB"
+
+	// dbPasswordEntropyBytes is the amount of randomness read from
+	// crypto/rand before base64-encoding, not the resulting string length.
+	dbPasswordEntropyBytes = 24
+
+	// certManagerClusterIssuerAnnotation is the annotation cert-manager's
+	// ingress-shim watches on any Ingress, regardless of which ingress
+	// controller is fulfilling it.
+	certManagerClusterIssuerAnnotation = "cert-manager.io/cluster-issuer"
+
+	// dbDataVolumeName names the StatefulSet's sole volumeClaimTemplate.
+	dbDataVolumeName = "data"
+
+	// dbPortName links the postgres container port and the headless
+	// Service's port by name; it also doubles as the container's own Name,
+	// since a single-container pod is conventionally named after what it
+	// runs.
+	dbPortName = "postgres"
+	dbPort     = 5432
 )
 
 // AppReconciler reconciles an App by driving a Deployment, a Service, and —
@@ -63,10 +92,11 @@ type AppReconciler struct {
 // +kubebuilder:rbac:groups=shipmate.florya.co,resources=apps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=shipmate.florya.co,resources=apps/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=shipmate.florya.co,resources=apps/finalizers,verbs=update
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create
 
 // Reconcile converges the cluster toward the App spec: it creates or updates
 // the always-present children (Deployment, Service), creates, updates, or
@@ -81,6 +111,9 @@ func (r *AppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	if err := r.reconcileDatabase(ctx, app); err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconciling database: %w", err)
+	}
 	deployment, err := r.reconcileDeployment(ctx, app)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling Deployment: %w", err)
@@ -117,6 +150,65 @@ func selectorLabels(app *shipmatev1alpha1.App) map[string]string {
 	}
 }
 
+// dbSelectorLabels are the database pods' pod-selector labels — distinct
+// from selectorLabels so the app Deployment's Service and the database
+// Service never select each other's pods.
+func dbSelectorLabels(app *shipmatev1alpha1.App) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/name":       dbWorkloadName(app),
+		"app.kubernetes.io/managed-by": managedByLabel,
+	}
+}
+
+func dbSecretName(app *shipmatev1alpha1.App) string   { return app.Name + "-db-credentials" }
+func dbWorkloadName(app *shipmatev1alpha1.App) string { return app.Name + "-db" }
+func tlsSecretName(app *shipmatev1alpha1.App) string  { return app.Name + "-tls" }
+
+// containerEnv returns the app container's environment: the user-specified
+// vars followed by shipmate-computed database vars, in that order, so the
+// computed ones win on a name collision — setting spec.database is an
+// explicit request for shipmate to own database connectivity. DATABASE_URL
+// is composed via Kubernetes' $(VAR) dependent-variable expansion rather
+// than concatenated in Go, so the password is never assembled outside the
+// container's own environment.
+func containerEnv(app *shipmatev1alpha1.App) []corev1.EnvVar {
+	if app.Spec.Database == nil {
+		return app.Spec.Env
+	}
+
+	secretRef := func(key string) *corev1.EnvVarSource {
+		return &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: dbSecretName(app)},
+			Key:                  key,
+		}}
+	}
+
+	// A fresh, correctly-capacitated slice, never append'd onto
+	// app.Spec.Env directly — appending onto a slice we don't own risks
+	// silently overwriting its backing array if it has spare capacity.
+	env := make([]corev1.EnvVar, 0, len(app.Spec.Env)+6)
+	env = append(env, app.Spec.Env...)
+	env = append(env,
+		corev1.EnvVar{Name: "PGHOST", Value: dbWorkloadName(app)},
+		corev1.EnvVar{Name: "PGPORT", Value: strconv.Itoa(dbPort)},
+		corev1.EnvVar{Name: "PGDATABASE", ValueFrom: secretRef(secretKeyPostgresDB)},
+		corev1.EnvVar{Name: "PGUSER", ValueFrom: secretRef(secretKeyPostgresUser)},
+		corev1.EnvVar{Name: "PGPASSWORD", ValueFrom: secretRef(secretKeyPostgresPassword)},
+		corev1.EnvVar{Name: "DATABASE_URL", Value: "postgres://$(PGUSER):$(PGPASSWORD)@$(PGHOST):$(PGPORT)/$(PGDATABASE)"},
+	)
+	return env
+}
+
+// randomPassword returns a URL-safe base64 encoding of entropyBytes read
+// from crypto/rand.
+func randomPassword(entropyBytes int) (string, error) {
+	buf := make([]byte, entropyBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("reading random bytes: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
 func (r *AppReconciler) reconcileDeployment(ctx context.Context, app *shipmatev1alpha1.App) (*appsv1.Deployment, error) {
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: app.Name, Namespace: app.Namespace},
@@ -131,7 +223,7 @@ func (r *AppReconciler) reconcileDeployment(ctx context.Context, app *shipmatev1
 		deployment.Spec.Template.Spec.Containers = []corev1.Container{{
 			Name:      "app",
 			Image:     app.Spec.Image,
-			Env:       app.Spec.Env,
+			Env:       containerEnv(app),
 			Resources: app.Spec.Resources,
 			Ports: []corev1.ContainerPort{{
 				Name:          portName,
@@ -162,7 +254,9 @@ func (r *AppReconciler) reconcileService(ctx context.Context, app *shipmatev1alp
 
 // reconcileIngress creates or updates the Ingress when spec.domain is set and
 // deletes it when the domain is cleared, so toggling exposure is a pure spec
-// edit with no manual cleanup.
+// edit with no manual cleanup. When spec.tls is also set, it annotates the
+// Ingress for cert-manager and adds a TLS block; clearing spec.tls (while
+// domain stays set) strips both back off.
 func (r *AppReconciler) reconcileIngress(ctx context.Context, app *shipmatev1alpha1.App) error {
 	ingress := &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{Name: app.Name, Namespace: app.Namespace},
@@ -192,7 +286,165 @@ func (r *AppReconciler) reconcileIngress(ctx context.Context, app *shipmatev1alp
 				},
 			},
 		}}
+
+		if app.Spec.TLS != nil {
+			if ingress.Annotations == nil {
+				ingress.Annotations = map[string]string{}
+			}
+			ingress.Annotations[certManagerClusterIssuerAnnotation] = app.Spec.TLS.ClusterIssuerName
+			ingress.Spec.TLS = []networkingv1.IngressTLS{{
+				Hosts:      []string{app.Spec.Domain},
+				SecretName: tlsSecretName(app),
+			}}
+		} else {
+			delete(ingress.Annotations, certManagerClusterIssuerAnnotation)
+			ingress.Spec.TLS = nil
+		}
+
 		return ctrl.SetControllerReference(app, ingress, r.Scheme)
+	})
+	return err
+}
+
+// reconcileDatabase provisions a single-instance Postgres when spec.database
+// is set, and tears down its compute (StatefulSet, headless Service) when
+// cleared. The credentials Secret and the StatefulSet's PersistentVolumeClaim
+// are never touched by the delete path — see DatabaseSpec's doc comment for
+// why data must outlive the App resource.
+func (r *AppReconciler) reconcileDatabase(ctx context.Context, app *shipmatev1alpha1.App) error {
+	if app.Spec.Database == nil {
+		if err := r.deleteIfOwned(ctx, app, &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Name: dbWorkloadName(app), Namespace: app.Namespace},
+		}); err != nil {
+			return fmt.Errorf("deleting database StatefulSet: %w", err)
+		}
+		if err := r.deleteIfOwned(ctx, app, &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: dbWorkloadName(app), Namespace: app.Namespace},
+		}); err != nil {
+			return fmt.Errorf("deleting database Service: %w", err)
+		}
+		return nil
+	}
+
+	if err := r.reconcileDatabaseSecret(ctx, app); err != nil {
+		return fmt.Errorf("reconciling database Secret: %w", err)
+	}
+	if err := r.reconcileDatabaseService(ctx, app); err != nil {
+		return fmt.Errorf("reconciling database Service: %w", err)
+	}
+	if err := r.reconcileDatabaseStatefulSet(ctx, app); err != nil {
+		return fmt.Errorf("reconciling database StatefulSet: %w", err)
+	}
+	return nil
+}
+
+// reconcileDatabaseSecret creates the database credentials Secret exactly
+// once and never modifies it afterward. Postgres bakes POSTGRES_PASSWORD
+// into its data directory at initdb time, so regenerating the Secret on a
+// later reconcile would desync it from the password the running database
+// actually accepts — this is a get-or-create, deliberately not the
+// CreateOrUpdate pattern used everywhere else in this file. It also carries
+// no owner reference, so it is not watched via Owns() and does not
+// participate in drift correction; it is written once and left alone.
+func (r *AppReconciler) reconcileDatabaseSecret(ctx context.Context, app *shipmatev1alpha1.App) error {
+	existing := &corev1.Secret{}
+	key := types.NamespacedName{Name: dbSecretName(app), Namespace: app.Namespace}
+	err := r.Get(ctx, key, existing)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	password, err := randomPassword(dbPasswordEntropyBytes)
+	if err != nil {
+		return fmt.Errorf("generating database password: %w", err)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      dbSecretName(app),
+			Namespace: app.Namespace,
+			Labels:    dbSelectorLabels(app),
+		},
+		StringData: map[string]string{
+			secretKeyPostgresUser:     app.Name,
+			secretKeyPostgresPassword: password,
+			secretKeyPostgresDB:       app.Name,
+		},
+	}
+	return r.Create(ctx, secret)
+}
+
+// reconcileDatabaseService creates the headless Service (ClusterIP: None)
+// that gives the StatefulSet's pod a stable DNS name for PGHOST.
+func (r *AppReconciler) reconcileDatabaseService(ctx context.Context, app *shipmatev1alpha1.App) error {
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: dbWorkloadName(app), Namespace: app.Namespace},
+	}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, service, func() error {
+		service.Labels = dbSelectorLabels(app)
+		service.Spec.ClusterIP = corev1.ClusterIPNone
+		service.Spec.Selector = dbSelectorLabels(app)
+		service.Spec.Ports = []corev1.ServicePort{{
+			Name:       dbPortName,
+			Port:       dbPort,
+			TargetPort: intstr.FromInt32(dbPort),
+		}}
+		return ctrl.SetControllerReference(app, service, r.Scheme)
+	})
+	return err
+}
+
+// reconcileDatabaseStatefulSet drives the single-replica Postgres workload.
+// VolumeClaimTemplates is immutable on an existing StatefulSet, so it is
+// only ever set on first creation (guarded by len == 0) — on the update
+// path the field already reflects the live object and re-assigning it would
+// make the API reject the update as an illegal mutation of an immutable
+// field.
+func (r *AppReconciler) reconcileDatabaseStatefulSet(ctx context.Context, app *shipmatev1alpha1.App) error {
+	db := app.Spec.Database
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: dbWorkloadName(app), Namespace: app.Namespace},
+	}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
+		labels := dbSelectorLabels(app)
+		singleReplica := int32(1)
+		sts.Labels = labels
+		sts.Spec.ServiceName = dbWorkloadName(app)
+		sts.Spec.Replicas = &singleReplica
+		sts.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
+		sts.Spec.Template.Labels = labels
+		sts.Spec.Template.Spec.Containers = []corev1.Container{{
+			Name:  dbPortName,
+			Image: "postgres:" + db.Version,
+			Ports: []corev1.ContainerPort{{Name: dbPortName, ContainerPort: dbPort}},
+			EnvFrom: []corev1.EnvFromSource{{
+				SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: dbSecretName(app)}},
+			}},
+			// PGDATA one level below the mount point: postgres refuses to
+			// initdb into a non-empty directory, and most CSI drivers seed
+			// the mount root with a lost+found entry.
+			Env: []corev1.EnvVar{{Name: "PGDATA", Value: "/var/lib/postgresql/data/pgdata"}},
+			VolumeMounts: []corev1.VolumeMount{{
+				Name:      dbDataVolumeName,
+				MountPath: "/var/lib/postgresql/data",
+			}},
+		}}
+		if len(sts.Spec.VolumeClaimTemplates) == 0 {
+			sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{{
+				ObjectMeta: metav1.ObjectMeta{Name: dbDataVolumeName},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceStorage: db.StorageSize},
+					},
+					StorageClassName: db.StorageClassName,
+				},
+			}}
+		}
+		return ctrl.SetControllerReference(app, sts, r.Scheme)
 	})
 	return err
 }
@@ -263,7 +515,11 @@ func (r *AppReconciler) updateStatus(ctx context.Context, app *shipmatev1alpha1.
 
 	app.Status.URL = ""
 	if app.Spec.Domain != "" {
-		app.Status.URL = "http://" + app.Spec.Domain
+		scheme := "http"
+		if app.Spec.TLS != nil {
+			scheme = "https"
+		}
+		app.Status.URL = scheme + "://" + app.Spec.Domain
 	}
 
 	available := metav1.ConditionFalse
@@ -315,9 +571,15 @@ func (r *AppReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&shipmatev1alpha1.App{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&networkingv1.Ingress{}).
 		Owns(&batchv1.CronJob{}).
+		// The database credentials Secret is deliberately not Owns()'d: it
+		// has no owner reference (see reconcileDatabaseSecret) and is never
+		// drift-corrected once created, so watching it would add overhead
+		// — Secrets are numerous cluster-wide — for a watch that could
+		// never match anything.
 		Named("app").
 		Complete(r)
 }

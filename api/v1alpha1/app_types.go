@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -69,8 +70,67 @@ type BackupSpec struct {
 	S3 S3Spec `json:"s3"`
 }
 
+// DatabaseSpec provisions a single-instance Postgres alongside the app as a
+// StatefulSet with a PersistentVolumeClaim. Credentials are generated once
+// into a Secret named "<app>-db-credentials" on first reconcile and are
+// never regenerated afterward — Postgres bakes the password into its data
+// directory at initdb time, so replacing the Secret later would desync it
+// from what the running database actually accepts. The same env vars are
+// injected into the app container so any Postgres client library picks them
+// up with zero extra configuration (DATABASE_URL, PGHOST, PGPORT, PGUSER,
+// PGPASSWORD, PGDATABASE).
+//
+// This is deliberately a minimal, single-replica database, not a substitute
+// for a dedicated Postgres operator (e.g. CloudNativePG): no replication, no
+// automated failover, no point-in-time recovery. Use spec.backup alongside
+// it for durability, and reach for a real Postgres operator when an app
+// needs HA. The point here is demonstrating shipmate's own reconciliation
+// and credential-lifecycle logic, not re-solving database HA.
+type DatabaseSpec struct {
+	// engine selects the database engine. Only "postgres" is supported today.
+	// +kubebuilder:validation:Enum=postgres
+	// +kubebuilder:default=postgres
+	// +optional
+	Engine string `json:"engine,omitempty"`
+
+	// version is the image tag for the database engine.
+	// +kubebuilder:default="16-alpine"
+	// +optional
+	Version string `json:"version,omitempty"`
+
+	// storageSize is the size of the PersistentVolumeClaim for data.
+	// +kubebuilder:default="1Gi"
+	// +optional
+	StorageSize resource.Quantity `json:"storageSize,omitempty"`
+
+	// storageClassName selects a specific StorageClass; empty uses the
+	// cluster default.
+	// +optional
+	StorageClassName *string `json:"storageClassName,omitempty"`
+}
+
+// TLSSpec requests a certificate from cert-manager for spec.domain via the
+// named ClusterIssuer. shipmate only annotates the Ingress and sets its TLS
+// block — it does not install, manage, or depend on cert-manager being
+// present. If cert-manager's CRDs and webhook are not installed, the
+// annotation is inert: the Ingress simply never receives a certificate,
+// there is no reconcile failure. This is unlike a hypothetical ServiceMonitor
+// integration, where creating an object of a CRD kind that doesn't exist in
+// the cluster would hard-fail the reconcile — an annotation on a
+// core/networking type has no such dependency.
+type TLSSpec struct {
+	// clusterIssuerName is the cert-manager ClusterIssuer to request
+	// certificates from.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	ClusterIssuerName string `json:"clusterIssuerName"`
+}
+
+// +kubebuilder:validation:XValidation:rule="!has(self.tls) || self.domain != ''",message="spec.tls requires spec.domain to be set"
+
 // AppSpec defines the desired state of App: one deployable web workload with
-// optional ingress, scheduled backups, and Prometheus scraping.
+// optional ingress, TLS, a database, scheduled backups, and Prometheus
+// scraping.
 type AppSpec struct {
 	// image is the container image to deploy.
 	// +required
@@ -95,6 +155,12 @@ type AppSpec struct {
 	// +optional
 	Domain string `json:"domain,omitempty"`
 
+	// tls requests a cert-manager certificate for domain. Requires domain to
+	// be set; clearing it later removes the TLS configuration from the
+	// Ingress (the Secret cert-manager created is left in place).
+	// +optional
+	TLS *TLSSpec `json:"tls,omitempty"`
+
 	// env is passed verbatim to the app container.
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
@@ -102,6 +168,13 @@ type AppSpec struct {
 	// resources are the app container's compute requests and limits.
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// database provisions a single-instance Postgres and injects its
+	// connection details into the app container; clearing it later removes
+	// the database StatefulSet and Service but retains its Secret and
+	// PersistentVolumeClaim (see DatabaseSpec).
+	// +optional
+	Database *DatabaseSpec `json:"database,omitempty"`
 
 	// backup schedules recurring backups; clearing it removes the CronJob.
 	// +optional

@@ -1,0 +1,28 @@
+apiVersion: shipmate.florya.co/v1alpha1
+kind: App
+metadata:
+  labels:
+    app.kubernetes.io/name: shipmate
+    app.kubernetes.io/managed-by: kustomize
+  name: app-with-database
+spec:
+  image: nginxdemos/hello:0.4
+  port: 80
+  replicas: 2
+  domain: db-demo.example.com
+  tls:
+    # Requires cert-manager and a ClusterIssuer of this name to already
+    # exist in the cluster — shipmate only annotates the Ingress, it does
+    # not install or manage cert-manager itself.
+    clusterIssuerName: letsencrypt-prod
+  database:
+    # engine/version/storageSize all default (postgres / 16-alpine / 1Gi);
+    # spelled out here for clarity.
+    engine: postgres
+    version: "16-alpine"
+    storageSize: 1Gi
+  env:
+    # PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE, and DATABASE_URL are
+    # injected automatically — nothing to declare here for the connection.
+    - name: GREETING
+      value: shipmate-with-database

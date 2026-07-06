@@ -27,6 +27,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -45,6 +46,8 @@ var _ = Describe("App Controller", func() {
 
 	appKey := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
 	backupKey := types.NamespacedName{Name: resourceName + "-backup", Namespace: resourceNamespace}
+	dbWorkloadKey := types.NamespacedName{Name: resourceName + "-db", Namespace: resourceNamespace}
+	dbSecretKey := types.NamespacedName{Name: resourceName + "-db-credentials", Namespace: resourceNamespace}
 
 	var reconciler *AppReconciler
 
@@ -88,6 +91,9 @@ var _ = Describe("App Controller", func() {
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace}},
 			&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace}},
 			&batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: resourceName + "-backup", Namespace: resourceNamespace}},
+			&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: dbWorkloadKey.Name, Namespace: resourceNamespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: dbWorkloadKey.Name, Namespace: resourceNamespace}},
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: dbSecretKey.Name, Namespace: resourceNamespace}},
 		}
 		for _, child := range children {
 			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, child))).To(Succeed())
@@ -189,6 +195,96 @@ var _ = Describe("App Controller", func() {
 		progressing := meta.FindStatusCondition(app.Status.Conditions, conditionProgressing)
 		Expect(progressing).NotTo(BeNil())
 		Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
+	})
+
+	It("provisions a database and injects connection env vars into the app container", func() {
+		reconcileApp()
+
+		updateApp(func(app *shipmatev1alpha1.App) {
+			app.Spec.Database = &shipmatev1alpha1.DatabaseSpec{
+				StorageSize: resource.MustParse("2Gi"),
+			}
+		})
+
+		secret := &corev1.Secret{}
+		Expect(k8sClient.Get(ctx, dbSecretKey, secret)).To(Succeed())
+		Expect(secret.Data["POSTGRES_PASSWORD"]).NotTo(BeEmpty())
+		originalPassword := string(secret.Data["POSTGRES_PASSWORD"])
+
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, dbWorkloadKey, sts)).To(Succeed())
+		Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("postgres:16-alpine"), "version should default")
+		Expect(sts.Spec.VolumeClaimTemplates).To(HaveLen(1))
+		Expect(sts.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests.Storage().String()).To(Equal("2Gi"))
+		Expect(metav1.IsControlledBy(sts, currentApp(ctx, appKey))).To(BeTrue())
+
+		svc := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, dbWorkloadKey, svc)).To(Succeed())
+		Expect(svc.Spec.ClusterIP).To(Equal(corev1.ClusterIPNone), "database Service must be headless")
+
+		deployment := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, appKey, deployment)).To(Succeed())
+		env := deployment.Spec.Template.Spec.Containers[0].Env
+		Expect(env).To(ContainElement(corev1.EnvVar{Name: "PGHOST", Value: resourceName + "-db"}))
+		Expect(env).To(ContainElement(HaveField("Name", "DATABASE_URL")))
+
+		// Re-reconciling must not regenerate the password (it would desync
+		// from what initdb already baked into the data directory) and must
+		// not trip the StatefulSet's immutable volumeClaimTemplates field.
+		reconcileApp()
+
+		Expect(k8sClient.Get(ctx, dbSecretKey, secret)).To(Succeed())
+		Expect(string(secret.Data["POSTGRES_PASSWORD"])).To(Equal(originalPassword))
+	})
+
+	It("removes database compute when spec.database is cleared but keeps credentials", func() {
+		reconcileApp()
+		updateApp(func(app *shipmatev1alpha1.App) {
+			app.Spec.Database = &shipmatev1alpha1.DatabaseSpec{StorageSize: resource.MustParse("1Gi")}
+		})
+		Expect(k8sClient.Get(ctx, dbWorkloadKey, &appsv1.StatefulSet{})).To(Succeed())
+
+		updateApp(func(app *shipmatev1alpha1.App) { app.Spec.Database = nil })
+
+		Expect(errors.IsNotFound(k8sClient.Get(ctx, dbWorkloadKey, &appsv1.StatefulSet{}))).To(BeTrue())
+		Expect(errors.IsNotFound(k8sClient.Get(ctx, dbWorkloadKey, &corev1.Service{}))).To(BeTrue())
+		Expect(k8sClient.Get(ctx, dbSecretKey, &corev1.Secret{})).To(Succeed(), "credentials Secret must survive")
+	})
+
+	It("adds cert-manager TLS to the Ingress when spec.tls is set and reports an https URL", func() {
+		reconcileApp()
+		updateApp(func(app *shipmatev1alpha1.App) { app.Spec.Domain = "secure.florya.co" })
+		updateApp(func(app *shipmatev1alpha1.App) {
+			app.Spec.TLS = &shipmatev1alpha1.TLSSpec{ClusterIssuerName: "letsencrypt-prod"}
+		})
+
+		ingress := &networkingv1.Ingress{}
+		Expect(k8sClient.Get(ctx, appKey, ingress)).To(Succeed())
+		Expect(ingress.Annotations["cert-manager.io/cluster-issuer"]).To(Equal("letsencrypt-prod"))
+		Expect(ingress.Spec.TLS).To(HaveLen(1))
+		Expect(ingress.Spec.TLS[0].Hosts).To(ContainElement("secure.florya.co"))
+		Expect(ingress.Spec.TLS[0].SecretName).To(Equal(resourceName + "-tls"))
+		Expect(currentApp(ctx, appKey).Status.URL).To(Equal("https://secure.florya.co"))
+
+		updateApp(func(app *shipmatev1alpha1.App) { app.Spec.TLS = nil })
+
+		Expect(k8sClient.Get(ctx, appKey, ingress)).To(Succeed())
+		Expect(ingress.Annotations).NotTo(HaveKey("cert-manager.io/cluster-issuer"))
+		Expect(ingress.Spec.TLS).To(BeEmpty())
+		Expect(currentApp(ctx, appKey).Status.URL).To(Equal("http://secure.florya.co"))
+	})
+
+	It("rejects spec.tls when spec.domain is not set", func() {
+		bad := &shipmatev1alpha1.App{
+			ObjectMeta: metav1.ObjectMeta{Name: "bad-tls-app", Namespace: resourceNamespace},
+			Spec: shipmatev1alpha1.AppSpec{
+				Image: "nginx:1.27",
+				TLS:   &shipmatev1alpha1.TLSSpec{ClusterIssuerName: "letsencrypt-prod"},
+			},
+		}
+		err := k8sClient.Create(ctx, bad)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("spec.tls requires spec.domain"))
 	})
 
 	It("does not delete a same-named Ingress it does not own", func() {

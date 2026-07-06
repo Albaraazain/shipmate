@@ -1,8 +1,8 @@
 # shipmate
 
 A Kubernetes operator that ships your apps. One custom resource declares a
-complete web application — workload, networking, scheduled backups — and a
-controller keeps the cluster converged on it.
+complete web application — workload, networking, TLS, a database, scheduled
+backups — and a controller keeps the cluster converged on it.
 
 ![shipmate demo: self-healing, scaling via the CR, and cascade deletion](docs/demo.gif)
 
@@ -32,8 +32,12 @@ spec:
 
 `kubectl apply` that, and shipmate reconciles a Deployment, a Service, an
 Ingress, and a nightly backup CronJob pointed at S3-compatible object storage.
-Edit it, and the cluster follows. Delete it, and everything it created is
-garbage-collected.
+Add `database: {}` and it also provisions a single-instance Postgres with
+generated credentials; add `tls: {clusterIssuerName: ...}` and it requests a
+cert-manager certificate for the domain. Edit the CR, and the cluster
+follows. Delete it, and everything it created is garbage-collected — except
+the database's credentials and data, which survive on purpose (see
+[Design decisions](#design-decisions)).
 
 ## Why
 
@@ -52,16 +56,18 @@ app is operated in software, declare *what* you want, and let an operator own
 ```
               ┌────────────────────────────────────────────────┐
               │                  App (CRD)                     │
-              │  image · port · replicas · domain · env        │
-              │  resources · backup{schedule,image,s3}         │
+              │  image · port · replicas · domain · tls · env  │
+              │  resources · database{engine,size} · backup    │
               └───────────────────────┬────────────────────────┘
                                       │ reconcile
               ┌───────────────────────┴────────────────────────┐
               │                                                │
    always     │   Deployment ──── Service                      │
               │                                                │
-   only if    │   Ingress          (spec.domain set)           │
-   requested  │   CronJob → S3     (spec.backup set)           │
+   only if    │   Ingress + cert-manager annotation (tls set)  │
+   requested  │   CronJob → S3                  (backup set)   │
+              │   StatefulSet + headless Svc  (database set)   │
+              │   + Secret (created once, survives removal)    │
               └────────────────────────────────────────────────┘
 ```
 
@@ -79,16 +85,27 @@ Reconciliation semantics, which are the actual point of the project:
 - **Ownership is respected.** Before deleting a no-longer-requested child,
   the controller verifies via owner reference that it created the object. A
   same-named Ingress created by someone else survives.
-- **Cleanup is delegated to garbage collection.** All children carry a
-  controller owner reference, so deleting an App cascades. There is
-  deliberately **no finalizer**: the controller holds no external state, and
-  backup objects in S3 are intentionally retained after an app is deleted —
-  auto-deleting backups on resource deletion is a footgun, not a feature.
+- **Cleanup is delegated to garbage collection — except data.** All children
+  carry a controller owner reference, so deleting an App cascades. There is
+  deliberately **no finalizer**: the controller holds no external state that
+  needs a blocking cleanup step. Two things are intentionally left behind on
+  delete: backup objects in S3, and the database's credentials Secret plus
+  its PersistentVolumeClaim. Auto-deleting either on resource deletion is a
+  footgun, not a feature.
+- **Database credentials are generated once, never rewritten.** Postgres
+  bakes its password into the data directory at `initdb` time. If shipmate
+  regenerated the Secret on every reconcile like it does every other child,
+  the stored password would desync from the one already running — so
+  `reconcileDatabaseSecret` is a get-or-create, the one deliberate exception
+  to the "recompute everything" rule above. Recreating an App after deleting
+  it reuses the surviving Secret and reattaches to the surviving PVC, and
+  the two stay consistent because neither was ever regenerated independently.
 - **Status is honest and cheap.** `Available` and `Progressing` conditions
   (standard `metav1.Condition`, with `observedGeneration`) mirror the
-  Deployment's readiness, plus `readyReplicas` and the external `url`. Status
-  writes are skipped when semantically unchanged, so owned-object events
-  don't fan out into useless PUTs and re-reconciles.
+  Deployment's readiness, plus `readyReplicas` and the external `url` (scheme
+  reflects whether `tls` is set). Status writes are skipped when
+  semantically unchanged, so owned-object events don't fan out into useless
+  PUTs and re-reconciles.
 
 ```console
 $ kubectl get apps
@@ -105,11 +122,20 @@ hello    nginxdemos/hello:0.4   2       http://hello.local         5m
 | `port` | no | `8080` | Container port; Service and Ingress route to it |
 | `replicas` | no | `1` | `0` is valid (scale to zero, `Available` reason `ScaledToZero`) |
 | `domain` | no | — | Set → Ingress at this host; clear → Ingress removed |
-| `env` | no | — | Passed verbatim to the container |
+| `tls.clusterIssuerName` | with tls | — | Requires `domain` (CEL-validated at admission); annotates the Ingress for cert-manager and sets its TLS block; `status.url` becomes `https://` |
+| `env` | no | — | Passed verbatim to the container; shipmate's own `database`-derived vars are appended after, so they win on a name collision |
 | `resources` | no | — | Standard requests/limits |
+| `database.engine` | no | `postgres` | Only value supported today |
+| `database.version` | no | `16-alpine` | Image tag for the database engine |
+| `database.storageSize` | no | `1Gi` | PVC size; immutable after first creation (StatefulSet constraint) |
+| `database.storageClassName` | no | cluster default | — |
 | `backup.schedule` | with backup | — | Cron expression |
 | `backup.image` / `backup.command` | with backup | — | Any image that can reach S3; connection details arrive as `S3_ENDPOINT`, `S3_BUCKET`, `S3_PREFIX` env vars |
 | `backup.s3.secretRef` | with backup | — | Secret holding `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; credentials are never inlined in the CR |
+
+Setting `database` injects `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`,
+`PGDATABASE`, and `DATABASE_URL` into the app container automatically —
+any Postgres client library picks these up with zero extra configuration.
 
 ## Quickstart
 
@@ -120,6 +146,11 @@ make install                        # CRD
 make deploy IMG=<registry>/shipmate:tag
 kubectl apply -f config/samples/shipmate_v1alpha1_app.yaml
 ```
+
+`config/samples/shipmate_v1alpha1_app_database_tls.yaml` shows the
+database + TLS fields together. TLS only does something if
+[cert-manager](https://cert-manager.io) and a matching `ClusterIssuer` are
+already installed — shipmate does not install or manage cert-manager itself.
 
 On [MicroK8s](https://microk8s.io) there is a one-shot demo that builds the
 image, sideloads it into containerd (no registry needed), deploys the
@@ -141,8 +172,11 @@ make test
 The suite runs against **envtest** — a real `kube-apiserver` + etcd, not
 fakes — and covers the behavior that matters: child creation with defaults,
 drift correction, Ingress/CronJob add *and remove* on spec toggles, foreign
-same-named objects surviving reconciliation, and status condition
-transitions. Controller package coverage: ~82%.
+same-named objects surviving reconciliation, status condition transitions,
+database provisioning with connection-env injection, database credentials
+surviving both a re-reconcile *and* `spec.database` being cleared, the
+TLS annotation/spec add-and-remove cycle, and CRD-level rejection of
+`tls` without `domain`. Controller package coverage: ~85%.
 
 ## Design decisions
 
@@ -156,16 +190,38 @@ transitions. Controller package coverage: ~82%.
   the operator would cover exactly one app shape. A scheduled
   image+command with S3 wiring covers Postgres, SQLite file copies, and
   anything rclone/restic can reach — matching a heterogeneous real fleet.
+- **A hand-rolled single-replica Postgres, not a dependency on a real
+  Postgres operator.** [CloudNativePG](https://cloudnative-pg.io) or the
+  Zalando operator already solve replication, failover, and point-in-time
+  recovery properly — depending on one of them would be the *correct*
+  choice for a production database. It would also mean writing zero
+  reconciliation code, which defeats the point of this specific project:
+  demonstrating shipmate's own credential-lifecycle and reconciliation
+  logic, not gluing in someone else's CRD. `spec.database` is scoped
+  accordingly — single instance, no HA — and is meant to be paired with
+  `spec.backup` for durability, not treated as a production database
+  story on its own.
+- **TLS is an annotation, not a discovery-gated integration.** Unlike a
+  hypothetical `ServiceMonitor` (a distinct CRD kind — creating one when
+  the Prometheus Operator isn't installed hard-fails the reconcile),
+  `spec.tls` only sets an annotation and a `tls:` block on a type
+  (`Ingress`) that always exists. If cert-manager isn't installed, the
+  annotation is simply inert — no failure mode, no discovery check needed.
 - **v1alpha1 and honest about it.** No conversion webhooks, no multi-version
   story yet. The API group is versioned so that adding them later is
   additive, not breaking.
 
 ## Roadmap
 
+- ~~TLS via cert-manager annotations when `spec.domain` is set.~~ Done —
+  see `spec.tls`.
+- ~~A managed database alongside the app.~~ Done — see `spec.database`
+  (single-instance Postgres; see Design decisions for why it isn't HA).
 - `ServiceMonitor` support behind a spec flag, guarded by CRD discovery, so
   the controller does not require the Prometheus Operator to exist.
-- Validating admission webhook (reject malformed cron expressions and
-  domains at admission time instead of at CronJob creation).
-- TLS via cert-manager annotations when `spec.domain` is set.
+- Validating admission webhook (reject malformed cron expressions at
+  admission time instead of at CronJob creation; the domain/tls check is
+  already enforced via a CEL rule on the CRD, no webhook needed for that
+  one).
 - A [charm](https://juju.is/docs/sdk) port — the same model, expressed in
   Canonical's operator framework.
